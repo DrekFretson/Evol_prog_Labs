@@ -24,7 +24,15 @@ GA_repair_onepoint
   std: 0
   worst: 1355
 
-Greedy baseline
+Greedy baseline (дополнительный конструктивный ориентир)
   utility: 1352
   price: 1919000
   power: 17700
+
+RandomFeasibleSearch (тот же бюджет оценок, что у ГА)
+  evaluations per run: 20080
+  best: 875
+  mean: 822.15
+  median: 816.5
+  std: 34.9741
+  worst: 739
