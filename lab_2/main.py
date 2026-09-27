@@ -153,6 +153,26 @@ def ga(items, conflicts, seed, constraint_method="repair", crossover_kind="unifo
         pop=new
     return best_seen,best_eval,history
 
+
+def random_feasible_baseline(items, conflicts, seed, evaluation_budget):
+    """Случайный допустимый поиск при том же числе оценок кандидатов, что и один запуск ГА."""
+    rng = random.Random(seed)
+    best_c = [0] * len(items)
+    best_e = evaluate(best_c, items, conflicts, "repair")
+    accepted = 0
+    attempts = 0
+    max_attempts = evaluation_budget * 30
+    while accepted < evaluation_budget and attempts < max_attempts:
+        attempts += 1
+        c = [1 if rng.random() < 0.12 else 0 for _ in items]
+        e = evaluate(c, items, conflicts, "repair")
+        if not e.feasible:
+            continue
+        accepted += 1
+        if e.utility > best_e.utility:
+            best_c, best_e = c[:], e
+    return best_c, best_e
+
 def greedy_baseline(items, conflicts):
     order=sorted(range(len(items)),key=lambda i:items[i].utility/(items[i].price/BUDGET+items[i].power/POWER_LIMIT),reverse=True)
     c=[0]*len(items)
@@ -190,6 +210,19 @@ def run_experiments():
     gc,ge=greedy_baseline(items,conflicts)
     all_rows.append(["Greedy",1,BASE_SEED,ge.utility,ge.price,ge.power,ge.conflicts,1])
 
+    # Fair stochastic baseline: same candidate-evaluation budget as GA:
+    # initial population + one population per generation.
+    evaluation_budget = POPULATION_SIZE * (GENERATIONS + 1)
+    random_baseline_values = []
+    best_random = None
+    for r in range(RUNS):
+        seed = BASE_SEED + r
+        rc, re = random_feasible_baseline(items, conflicts, seed, evaluation_budget)
+        random_baseline_values.append(re.utility)
+        all_rows.append(["RandomFeasibleSearch", r+1, seed, re.utility, re.price, re.power, re.conflicts, 1])
+        if best_random is None or re.utility > best_random[1].utility:
+            best_random = (rc, re)
+
     with open(RESULTS_DIR/"runs.csv","w",newline="",encoding="utf-8-sig") as f:
         w=csv.writer(f);w.writerow(["method","run","seed","utility","price_rub","power_w","conflicts","feasible"]);w.writerows(all_rows)
 
@@ -199,7 +232,13 @@ def run_experiments():
         lines += [name,f"  best: {max(vals):.6g}",f"  mean: {statistics.mean(vals):.6g}",f"  median: {statistics.median(vals):.6g}",
                   f"  std: {statistics.stdev(vals):.6g}",f"  worst: {min(vals):.6g}",""]
         save_best(name,*best_global[name],items)
-    lines += ["Greedy baseline",f"  utility: {ge.utility}",f"  price: {ge.price}",f"  power: {ge.power}"]
+    lines += ["Greedy baseline (дополнительный конструктивный ориентир)",f"  utility: {ge.utility}",f"  price: {ge.price}",f"  power: {ge.power}",""]
+    lines += ["RandomFeasibleSearch (тот же бюджет оценок, что у ГА)",f"  evaluations per run: {evaluation_budget}",
+              f"  best: {max(random_baseline_values):.6g}",f"  mean: {statistics.mean(random_baseline_values):.6g}",
+              f"  median: {statistics.median(random_baseline_values):.6g}",
+              f"  std: {statistics.stdev(random_baseline_values):.6g}",
+              f"  worst: {min(random_baseline_values):.6g}"]
+    save_best("RandomFeasibleSearch", *best_random, items)
     (RESULTS_DIR/"summary.txt").write_text("\n".join(lines),encoding="utf-8")
 
     # Convergence
@@ -213,7 +252,7 @@ def run_experiments():
     plt.savefig(RESULTS_DIR/"convergence.png",dpi=160);plt.close()
 
     # Boxplot
-    labels=[x[0] for x in configs]
+    labels=[x[0] for x in configs] + ["RandomFeasibleSearch"]
     data=[[r[3] for r in all_rows if r[0]==name] for name in labels]
     plt.figure(figsize=(10,6));plt.boxplot(data,tick_labels=labels)
     plt.axhline(ge.utility,linestyle="--",label=f"Greedy = {ge.utility}")

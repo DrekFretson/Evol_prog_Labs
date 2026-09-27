@@ -1,0 +1,18 @@
+{
+  "variant": 5,
+  "function": "Griewank",
+  "dimension": 10,
+  "bounds": [
+    -600,
+    600
+  ],
+  "independent_runs": 20,
+  "population_size": 60,
+  "generations": 300,
+  "compared_mutation_probabilities": [
+    0.05,
+    0.2
+  ],
+  "baseline": "RandomSearch",
+  "note": "Параметры соответствуют реализации main.py; seed фиксируются программой."
+}

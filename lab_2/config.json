@@ -1,0 +1,29 @@
+{
+  "variant": 5,
+  "problem": "Выбор комплекта оборудования для лаборатории",
+  "budget_rub": 2000000,
+  "power_limit_w": 18000,
+  "objects": 40,
+  "population_size": 80,
+  "generations": 250,
+  "independent_runs": 20,
+  "crossover_rate": 0.9,
+  "mutation_rate": 0.03,
+  "tournament_size": 3,
+  "elite_count": 2,
+  "data_seed": 20260927,
+  "run_seed_start": 2505,
+  "constraint_methods": [
+    "repair",
+    "penalty"
+  ],
+  "crossovers": [
+    "uniform",
+    "onepoint"
+  ],
+  "baselines": [
+    "Greedy",
+    "RandomFeasibleSearch"
+  ],
+  "equal_evaluation_budget": 20080
+}

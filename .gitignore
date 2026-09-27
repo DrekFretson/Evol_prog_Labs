@@ -1,11 +1,11 @@
 # PyCharm
 .idea/
 
-# Virtual environment
+# Virtual environments
 .venv/
 venv/
 
-# Python
+# Python cache
 __pycache__/
 *.py[cod]
 
