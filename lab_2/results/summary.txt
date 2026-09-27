@@ -1,0 +1,30 @@
+ЛР №2, вариант 5 — выбор оборудования
+Бюджет: 2000000 руб.
+Лимит мощности: 18000 Вт
+Независимых запусков ГА: 20
+
+GA_repair_uniform
+  best: 1355
+  mean: 1355
+  median: 1355
+  std: 0
+  worst: 1355
+
+GA_penalty_uniform
+  best: 1355
+  mean: 1353.5
+  median: 1353.5
+  std: 1.53897
+  worst: 1352
+
+GA_repair_onepoint
+  best: 1355
+  mean: 1355
+  median: 1355
+  std: 0
+  worst: 1355
+
+Greedy baseline
+  utility: 1352
+  price: 1919000
+  power: 17700
