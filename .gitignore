@@ -1,13 +1,22 @@
-# PyCharm
+# PyCharm / IntelliJ
 .idea/
 
 # Virtual environments
 .venv/
 venv/
+env/
 
 # Python cache
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Python tools cache
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
 
 # OS
 .DS_Store
