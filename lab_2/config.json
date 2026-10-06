@@ -1,29 +1,39 @@
 {
-  "variant": 5,
-  "problem": "Выбор комплекта оборудования для лаборатории",
-  "budget_rub": 2000000,
-  "power_limit_w": 18000,
-  "objects": 40,
-  "population_size": 80,
-  "generations": 250,
+  "variant": 19,
+  "problem": "Построение расписания экзаменов с конфликтами студентов",
+
+  "num_exams": 30,
+  "num_students": 120,
+
+  "num_slots": 12,
+  "sessions_per_day": 2,
+
+  "population_size": 30,
+  "generations": 60,
   "independent_runs": 20,
+
   "crossover_rate": 0.9,
-  "mutation_rate": 0.03,
+  "mutation_rate": 0.08,
+
   "tournament_size": 3,
   "elite_count": 2,
-  "data_seed": 20260927,
-  "run_seed_start": 2505,
+
+  "hard_conflict_penalty": 1000.0,
+  "same_day_weight": 1.0,
+  "used_slot_weight": 0.5,
+
+  "constructor_noise": 2.0,
+
+  "data_seed": 20261019,
+  "run_seed_start": 2519,
+
   "constraint_methods": [
     "repair",
     "penalty"
   ],
+
   "crossovers": [
     "uniform",
     "onepoint"
-  ],
-  "baselines": [
-    "Greedy",
-    "RandomFeasibleSearch"
-  ],
-  "equal_evaluation_budget": 20080
+  ]
 }

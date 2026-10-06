@@ -1,284 +1,2920 @@
-"""ЛР №2, вариант 5.
-Выбор комплекта оборудования для лаборатории при ограничениях бюджета,
-мощности и совместимости. Ключевые части ГА реализованы без готовых GA-библиотек.
-"""
 from __future__ import annotations
-import argparse, csv, random, statistics
+
+import argparse
+import csv
+import json
+import math
+import random
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Dict
 
 import matplotlib.pyplot as plt
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-RESULTS_DIR = BASE_DIR / "results"
+from generate_data import generate_dataset
 
-BUDGET = 2_000_000
-POWER_LIMIT = 18_000
-POPULATION_SIZE = 80
-GENERATIONS = 250
-RUNS = 20
-CROSSOVER_RATE = 0.9
-MUTATION_RATE = 0.03
-TOURNAMENT_SIZE = 3
-ELITE_COUNT = 2
-PENALTY_BUDGET = 0.00020
-PENALTY_POWER = 0.020
-PENALTY_CONFLICT = 45.0
-BASE_SEED = 2505
+
+VARIANT = 19
+
+BASE_DIR = Path(
+    __file__
+).resolve().parent
+
+DATA_DIR = (
+    BASE_DIR
+    / "data"
+)
+
+RESULTS_DIR = (
+    BASE_DIR
+    / "results"
+)
+
 
 @dataclass(frozen=True)
-class Equipment:
-    id: int
+class Exam:
+    exam_id: int
     name: str
-    price: int
-    power: int
-    utility: int
-    category: str
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    hard_conflict_pairs: int
+    conflicting_students: int
+    same_day_students: int
+    used_slots: int
+    soft_penalty: float
+    score: float
+    feasible: bool
+
 
 @dataclass
-class Eval:
-    utility: int
-    price: int
-    power: int
-    conflicts: int
-    feasible: bool
-    fitness: float
+class GARunResult:
+    best_schedule: list[int]
+    best_evaluation: Evaluation
+    history: list[float]
+
+
+# ============================================================
+# Конфигурация
+# ============================================================
+
+def load_config(
+    path: Path,
+) -> dict:
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        config = json.load(
+            file
+        )
+
+    if config["variant"] != VARIANT:
+        raise ValueError(
+            f"Ожидается вариант {VARIANT}."
+        )
+
+    if config["num_exams"] < 20:
+        raise ValueError(
+            "Для задачи расписания "
+            "требуется минимум 20 событий."
+        )
+
+    if (
+        config["independent_runs"]
+        < 20
+    ):
+        raise ValueError(
+            "По заданию требуется минимум "
+            "20 независимых запусков."
+        )
+
+    if (
+        config["elite_count"]
+        >= config["population_size"]
+    ):
+        raise ValueError(
+            "elite_count должен быть "
+            "меньше population_size."
+        )
+
+    return config
+
+
+# ============================================================
+# Генерация данных
+# ============================================================
+
+def ensure_data(
+    config: dict,
+    regenerate: bool = False,
+) -> None:
+
+    required_files = [
+        DATA_DIR / "exams.csv",
+        DATA_DIR / "enrollments.csv",
+        DATA_DIR / "conflicts.csv",
+    ]
+
+    if (
+        regenerate
+        or not all(
+            path.exists()
+            for path
+            in required_files
+        )
+    ):
+        generate_dataset(
+            root=BASE_DIR,
+            seed=config[
+                "data_seed"
+            ],
+            num_exams=config[
+                "num_exams"
+            ],
+            num_students=config[
+                "num_students"
+            ],
+        )
+
+
+# ============================================================
+# Загрузка данных
+# ============================================================
 
 def load_data():
-    items=[]
-    with open(DATA_DIR/"equipment.csv", encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            items.append(Equipment(int(r["id"]),r["name"],int(r["price_rub"]),int(r["power_w"]),
-                                   int(r["utility"]),r["category"]))
-    conflicts=[]
-    with open(DATA_DIR/"conflicts.csv", encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            conflicts.append((int(r["item_a"])-1,int(r["item_b"])-1))
-    return items, conflicts
 
-def raw_metrics(chrom, items, conflicts):
-    selected=[i for i,b in enumerate(chrom) if b]
-    price=sum(items[i].price for i in selected)
-    power=sum(items[i].power for i in selected)
-    utility=sum(items[i].utility for i in selected)
-    nconf=sum(1 for a,b in conflicts if chrom[a] and chrom[b])
-    return utility,price,power,nconf
+    exams = []
 
-def evaluate(chrom, items, conflicts, method="repair"):
-    utility,price,power,nconf=raw_metrics(chrom,items,conflicts)
-    feasible=price<=BUDGET and power<=POWER_LIMIT and nconf==0
-    if method=="penalty":
-        penalty=max(0,price-BUDGET)*PENALTY_BUDGET + max(0,power-POWER_LIMIT)*PENALTY_POWER + nconf*PENALTY_CONFLICT
-        fitness=utility-penalty
-    else:
-        fitness=float(utility) if feasible else -1e12
-    return Eval(utility,price,power,nconf,feasible,fitness)
+    with (
+        DATA_DIR
+        / "exams.csv"
+    ).open(
+        encoding="utf-8-sig"
+    ) as file:
 
-def repair(chrom, items, conflicts):
-    """Детерминированно-случайный repair: сначала конфликты, затем ресурсы."""
-    c=chrom[:]
-    # Remove lower utility/resource-efficiency item from each active conflict.
-    changed=True
-    while changed:
-        changed=False
-        for a,b in conflicts:
-            if c[a] and c[b]:
-                sa=items[a].utility/(items[a].price/BUDGET + items[a].power/POWER_LIMIT + 1e-9)
-                sb=items[b].utility/(items[b].price/BUDGET + items[b].power/POWER_LIMIT + 1e-9)
-                c[a if sa < sb else b]=0
-                changed=True
-    while True:
-        u,p,w,nc=raw_metrics(c,items,conflicts)
-        if p<=BUDGET and w<=POWER_LIMIT and nc==0: break
-        selected=[i for i,b in enumerate(c) if b]
-        if not selected: break
-        worst=min(selected,key=lambda i: items[i].utility/(items[i].price/BUDGET+items[i].power/POWER_LIMIT+1e-9))
-        c[worst]=0
-    return c
+        for row in csv.DictReader(
+            file
+        ):
+            exams.append(
+                Exam(
+                    exam_id=int(
+                        row[
+                            "exam_id"
+                        ]
+                    ),
+                    name=row[
+                        "exam_name"
+                    ],
+                )
+            )
 
-def random_chromosome(n, rng):
-    return [1 if rng.random()<0.35 else 0 for _ in range(n)]
+    exams.sort(
+        key=lambda exam:
+        exam.exam_id
+    )
 
-def tournament(pop, scores, rng):
-    cand=rng.sample(range(len(pop)),TOURNAMENT_SIZE)
-    return pop[max(cand,key=lambda i:scores[i])][:]
+    expected_ids = list(
+        range(
+            1,
+            len(exams) + 1,
+        )
+    )
 
-def one_point(a,b,rng):
-    if len(a)<2: return a[:],b[:]
-    p=rng.randrange(1,len(a))
-    return a[:p]+b[p:], b[:p]+a[p:]
+    actual_ids = [
+        exam.exam_id
+        for exam in exams
+    ]
 
-def uniform(a,b,rng):
-    c1=[];c2=[]
-    for x,y in zip(a,b):
-        if rng.random()<0.5: c1.append(x);c2.append(y)
-        else: c1.append(y);c2.append(x)
-    return c1,c2
+    if (
+        actual_ids
+        != expected_ids
+    ):
+        raise ValueError(
+            "exam_id должны идти "
+            "подряд от 1 до N."
+        )
 
-def mutate(c,rng):
-    out=c[:]
-    for i in range(len(out)):
-        if rng.random()<MUTATION_RATE: out[i]=1-out[i]
-    return out
+    # Количество студентов
+    # на каждом экзамене.
+    student_counts = [
+        0
+        for _ in exams
+    ]
 
-def ga(items, conflicts, seed, constraint_method="repair", crossover_kind="uniform"):
-    rng=random.Random(seed)
-    pop=[random_chromosome(len(items),rng) for _ in range(POPULATION_SIZE)]
-    if constraint_method=="repair": pop=[repair(c,items,conflicts) for c in pop]
-    history=[]
-    best_seen=None; best_eval=None
-    for gen in range(GENERATIONS+1):
-        ev=[evaluate(c,items,conflicts,constraint_method) for c in pop]
-        scores=[x.fitness for x in ev]
-        feasible=[(c,e) for c,e in zip(pop,ev) if e.feasible]
-        if feasible:
-            c,e=max(feasible,key=lambda ce:ce[1].utility)
-            if best_eval is None or e.utility>best_eval.utility:
-                best_seen=c[:];best_eval=e
-        history.append(best_eval.utility if best_eval else 0)
-        if gen==GENERATIONS: break
-        elite_idx=sorted(range(len(pop)),key=lambda i:scores[i],reverse=True)[:ELITE_COUNT]
-        new=[pop[i][:] for i in elite_idx]
-        while len(new)<POPULATION_SIZE:
-            p1=tournament(pop,scores,rng); p2=tournament(pop,scores,rng)
-            if rng.random()<CROSSOVER_RATE:
-                c1,c2=(uniform(p1,p2,rng) if crossover_kind=="uniform" else one_point(p1,p2,rng))
-            else: c1,c2=p1[:],p2[:]
-            for child in (mutate(c1,rng),mutate(c2,rng)):
-                if constraint_method=="repair": child=repair(child,items,conflicts)
-                new.append(child)
-                if len(new)>=POPULATION_SIZE: break
-        pop=new
-    return best_seen,best_eval,history
+    with (
+        DATA_DIR
+        / "enrollments.csv"
+    ).open(
+        encoding="utf-8-sig"
+    ) as file:
+
+        for row in csv.DictReader(
+            file
+        ):
+            exam_index = (
+                int(
+                    row[
+                        "exam_id"
+                    ]
+                )
+                - 1
+            )
+
+            student_counts[
+                exam_index
+            ] += 1
+
+    conflicts = []
+
+    with (
+        DATA_DIR
+        / "conflicts.csv"
+    ).open(
+        encoding="utf-8-sig"
+    ) as file:
+
+        for row in csv.DictReader(
+            file
+        ):
+            conflicts.append(
+                (
+                    int(
+                        row[
+                            "exam_a"
+                        ]
+                    ) - 1,
+
+                    int(
+                        row[
+                            "exam_b"
+                        ]
+                    ) - 1,
+
+                    int(
+                        row[
+                            "shared_students"
+                        ]
+                    ),
+                )
+            )
+
+    if len(conflicts) < 10:
+        raise ValueError(
+            "Для варианта расписания "
+            "нужно минимум 10 конфликтов."
+        )
+
+    return (
+        exams,
+        conflicts,
+        student_counts,
+    )
 
 
-def random_feasible_baseline(items, conflicts, seed, evaluation_budget):
-    """Случайный допустимый поиск при том же числе оценок кандидатов, что и один запуск ГА."""
-    rng = random.Random(seed)
-    best_c = [0] * len(items)
-    best_e = evaluate(best_c, items, conflicts, "repair")
-    accepted = 0
-    attempts = 0
-    max_attempts = evaluation_budget * 30
-    while accepted < evaluation_budget and attempts < max_attempts:
-        attempts += 1
-        c = [1 if rng.random() < 0.12 else 0 for _ in items]
-        e = evaluate(c, items, conflicts, "repair")
-        if not e.feasible:
+# ============================================================
+# Граф конфликтов
+# ============================================================
+
+def build_adjacency(
+    exam_count,
+    conflicts,
+):
+
+    adjacency = [
+        []
+        for _ in range(
+            exam_count
+        )
+    ]
+
+    for (
+        exam_a,
+        exam_b,
+        shared_students,
+    ) in conflicts:
+
+        adjacency[
+            exam_a
+        ].append(
+            (
+                exam_b,
+                shared_students,
+            )
+        )
+
+        adjacency[
+            exam_b
+        ].append(
+            (
+                exam_a,
+                shared_students,
+            )
+        )
+
+    return adjacency
+
+
+# ============================================================
+# Оценка расписания
+# ============================================================
+
+def evaluate_schedule(
+    schedule,
+    conflicts,
+    config,
+):
+
+    hard_conflict_pairs = 0
+
+    conflicting_students = 0
+
+    same_day_students = 0
+
+    sessions_per_day = (
+        config[
+            "sessions_per_day"
+        ]
+    )
+
+    for (
+        exam_a,
+        exam_b,
+        shared_students,
+    ) in conflicts:
+
+        slot_a = schedule[
+            exam_a
+        ]
+
+        slot_b = schedule[
+            exam_b
+        ]
+
+        # Жёсткое нарушение:
+        # общий студент должен
+        # одновременно сдавать
+        # два экзамена.
+        if slot_a == slot_b:
+
+            hard_conflict_pairs += 1
+
+            conflicting_students += (
+                shared_students
+            )
+
+        # Мягкое нарушение:
+        # два экзамена попали
+        # студенту на один день.
+        elif (
+            slot_a
+            // sessions_per_day
+            ==
+            slot_b
+            // sessions_per_day
+        ):
+            same_day_students += (
+                shared_students
+            )
+
+    used_slots = len(
+        set(schedule)
+    )
+
+    soft_penalty = (
+        config[
+            "same_day_weight"
+        ]
+        * same_day_students
+        +
+        config[
+            "used_slot_weight"
+        ]
+        * used_slots
+    )
+
+    score = (
+        config[
+            "hard_conflict_penalty"
+        ]
+        * conflicting_students
+        +
+        soft_penalty
+    )
+
+    return Evaluation(
+        hard_conflict_pairs=(
+            hard_conflict_pairs
+        ),
+        conflicting_students=(
+            conflicting_students
+        ),
+        same_day_students=(
+            same_day_students
+        ),
+        used_slots=used_slots,
+        soft_penalty=(
+            soft_penalty
+        ),
+        score=score,
+        feasible=(
+            hard_conflict_pairs
+            == 0
+        ),
+    )
+
+
+# ============================================================
+# Построение допустимого решения
+# ============================================================
+
+def construct_feasible_schedule(
+    adjacency,
+    config,
+    rng,
+    noise=None,
+):
+
+    exam_count = len(
+        adjacency
+    )
+
+    num_slots = config[
+        "num_slots"
+    ]
+
+    sessions_per_day = (
+        config[
+            "sessions_per_day"
+        ]
+    )
+
+    if noise is None:
+        noise = config[
+            "constructor_noise"
+        ]
+
+    # Экзамены с большим
+    # количеством конфликтов
+    # рассматриваются первыми.
+    order = list(
+        range(
+            exam_count
+        )
+    )
+
+    rng.shuffle(order)
+
+    order.sort(
+        key=lambda exam:
+        len(
+            adjacency[
+                exam
+            ]
+        ),
+        reverse=True,
+    )
+
+    schedule = [
+        -1
+        for _ in range(
+            exam_count
+        )
+    ]
+
+    slot_counts = [
+        0
+        for _ in range(
+            num_slots
+        )
+    ]
+
+    for exam in order:
+
+        candidates = []
+
+        for slot in range(
+            num_slots
+        ):
+
+            hard_students = 0
+
+            same_day_students = 0
+
+            day = (
+                slot
+                // sessions_per_day
+            )
+
+            for (
+                neighbour,
+                shared_students,
+            ) in adjacency[
+                exam
+            ]:
+
+                neighbour_slot = (
+                    schedule[
+                        neighbour
+                    ]
+                )
+
+                if neighbour_slot == -1:
+                    continue
+
+                if (
+                    neighbour_slot
+                    == slot
+                ):
+                    hard_students += (
+                        shared_students
+                    )
+
+                elif (
+                    neighbour_slot
+                    // sessions_per_day
+                    ==
+                    day
+                ):
+                    same_day_students += (
+                        shared_students
+                    )
+
+            # Если в этом слоте
+            # будет жёсткий конфликт,
+            # слот запрещён.
+            if hard_students != 0:
+                continue
+
+            if (
+                slot_counts[
+                    slot
+                ]
+                == 0
+            ):
+                new_slot_penalty = (
+                    config[
+                        "used_slot_weight"
+                    ]
+                )
+            else:
+                new_slot_penalty = 0.0
+
+            candidate_score = (
+                config[
+                    "same_day_weight"
+                ]
+                * same_day_students
+                +
+                new_slot_penalty
+                +
+                rng.random()
+                * noise
+            )
+
+            candidates.append(
+                (
+                    candidate_score,
+                    slot,
+                )
+            )
+
+        if not candidates:
+            return None
+
+        (
+            _,
+            chosen_slot,
+        ) = min(
+            candidates
+        )
+
+        schedule[
+            exam
+        ] = chosen_slot
+
+        slot_counts[
+            chosen_slot
+        ] += 1
+
+    return schedule
+
+
+# ============================================================
+# Начальная популяция
+# ============================================================
+
+def create_initial_population(
+    adjacency,
+    conflicts,
+    config,
+    rng,
+):
+
+    population = []
+
+    while (
+        len(population)
+        <
+        config[
+            "population_size"
+        ]
+    ):
+
+        schedule = (
+            construct_feasible_schedule(
+                adjacency,
+                config,
+                rng,
+            )
+        )
+
+        if schedule is None:
             continue
-        accepted += 1
-        if e.utility > best_e.utility:
-            best_c, best_e = c[:], e
-    return best_c, best_e
 
-def greedy_baseline(items, conflicts):
-    order=sorted(range(len(items)),key=lambda i:items[i].utility/(items[i].price/BUDGET+items[i].power/POWER_LIMIT),reverse=True)
-    c=[0]*len(items)
-    for i in order:
-        trial=c[:];trial[i]=1
-        if evaluate(trial,items,conflicts,"repair").feasible: c=trial
-    return c,evaluate(c,items,conflicts,"repair")
+        evaluation = (
+            evaluate_schedule(
+                schedule,
+                conflicts,
+                config,
+            )
+        )
 
-def save_best(name, chrom, ev, items):
-    with open(RESULTS_DIR/f"best_{name}.csv","w",newline="",encoding="utf-8-sig") as f:
-        w=csv.writer(f);w.writerow(["id","name","price_rub","power_w","utility","category"])
-        for i,b in enumerate(chrom or []):
-            if b:
-                x=items[i];w.writerow([x.id,x.name,x.price,x.power,x.utility,x.category])
-        w.writerow([])
-        w.writerow(["TOTAL","",ev.price if ev else 0,ev.power if ev else 0,ev.utility if ev else 0,""])
+        if evaluation.feasible:
+            population.append(
+                schedule
+            )
 
-def run_experiments():
-    RESULTS_DIR.mkdir(exist_ok=True)
-    items,conflicts=load_data()
-    configs=[
-        ("GA_repair_uniform","repair","uniform"),
-        ("GA_penalty_uniform","penalty","uniform"),
-        ("GA_repair_onepoint","repair","onepoint"),
+    return population
+
+
+# ============================================================
+# Repair
+# ============================================================
+
+def repair_schedule(
+    schedule,
+    adjacency,
+    conflicts,
+    config,
+    rng,
+):
+
+    repaired = schedule[:]
+
+    exam_count = len(
+        repaired
+    )
+
+    num_slots = config[
+        "num_slots"
     ]
-    all_rows=[]; histories={k:[] for k,_,_ in configs}; best_global={}
-    for name,method,cross in configs:
-        for r in range(RUNS):
-            seed=BASE_SEED+r
-            c,e,h=ga(items,conflicts,seed,method,cross)
-            histories[name].append(h)
-            if e:
-                all_rows.append([name,r+1,seed,e.utility,e.price,e.power,e.conflicts,int(e.feasible)])
-                if name not in best_global or e.utility>best_global[name][1].utility: best_global[name]=(c,e)
-    gc,ge=greedy_baseline(items,conflicts)
-    all_rows.append(["Greedy",1,BASE_SEED,ge.utility,ge.price,ge.power,ge.conflicts,1])
 
-    # Fair stochastic baseline: same candidate-evaluation budget as GA:
-    # initial population + one population per generation.
-    evaluation_budget = POPULATION_SIZE * (GENERATIONS + 1)
-    random_baseline_values = []
+    sessions_per_day = (
+        config[
+            "sessions_per_day"
+        ]
+    )
+
+    slot_counts = [
+        0
+        for _ in range(
+            num_slots
+        )
+    ]
+
+    for slot in repaired:
+        slot_counts[
+            slot
+        ] += 1
+
+    # Повторяем переносы,
+    # пока существуют конфликты.
+    for _ in range(
+        exam_count * 4
+    ):
+
+        conflict_weight = [
+            0
+            for _ in range(
+                exam_count
+            )
+        ]
+
+        total_conflicting_students = 0
+
+        for (
+            exam_a,
+            exam_b,
+            shared_students,
+        ) in conflicts:
+
+            if (
+                repaired[
+                    exam_a
+                ]
+                ==
+                repaired[
+                    exam_b
+                ]
+            ):
+                conflict_weight[
+                    exam_a
+                ] += (
+                    shared_students
+                )
+
+                conflict_weight[
+                    exam_b
+                ] += (
+                    shared_students
+                )
+
+                total_conflicting_students += (
+                    shared_students
+                )
+
+        if (
+            total_conflicting_students
+            == 0
+        ):
+            return repaired
+
+        max_weight = max(
+            conflict_weight
+        )
+
+        candidates = [
+            exam
+            for exam, weight
+            in enumerate(
+                conflict_weight
+            )
+            if weight
+            == max_weight
+        ]
+
+        exam = rng.choice(
+            candidates
+        )
+
+        old_slot = repaired[
+            exam
+        ]
+
+        slot_counts[
+            old_slot
+        ] -= 1
+
+        variants = []
+
+        for slot in range(
+            num_slots
+        ):
+
+            if slot == old_slot:
+                continue
+
+            hard_students = 0
+            same_day_students = 0
+
+            day = (
+                slot
+                // sessions_per_day
+            )
+
+            for (
+                neighbour,
+                shared_students,
+            ) in adjacency[
+                exam
+            ]:
+
+                neighbour_slot = (
+                    repaired[
+                        neighbour
+                    ]
+                )
+
+                if (
+                    neighbour_slot
+                    == slot
+                ):
+                    hard_students += (
+                        shared_students
+                    )
+
+                elif (
+                    neighbour_slot
+                    // sessions_per_day
+                    ==
+                    day
+                ):
+                    same_day_students += (
+                        shared_students
+                    )
+
+            if (
+                slot_counts[
+                    slot
+                ]
+                == 0
+            ):
+                new_slot_penalty = (
+                    config[
+                        "used_slot_weight"
+                    ]
+                )
+            else:
+                new_slot_penalty = 0.0
+
+            score = (
+                config[
+                    "hard_conflict_penalty"
+                ]
+                * hard_students
+                +
+                config[
+                    "same_day_weight"
+                ]
+                * same_day_students
+                +
+                new_slot_penalty
+                +
+                rng.random()
+                * 1e-6
+            )
+
+            variants.append(
+                (
+                    score,
+                    slot,
+                )
+            )
+
+        (
+            _,
+            new_slot,
+        ) = min(
+            variants
+        )
+
+        repaired[
+            exam
+        ] = new_slot
+
+        slot_counts[
+            new_slot
+        ] += 1
+
+    # Если локальный repair
+    # не справился,
+    # строим новое допустимое
+    # расписание.
+    fallback = (
+        construct_feasible_schedule(
+            adjacency,
+            config,
+            rng,
+            noise=0.25,
+        )
+    )
+
+    if fallback is not None:
+        return fallback
+
+    return repaired
+
+
+# ============================================================
+# Турнирная селекция
+# ============================================================
+
+def tournament_selection(
+    population,
+    evaluations,
+    config,
+    rng,
+):
+
+    indices = rng.sample(
+        range(
+            len(population)
+        ),
+        config[
+            "tournament_size"
+        ],
+    )
+
+    best_index = min(
+        indices,
+        key=lambda index:
+        evaluations[
+            index
+        ].score,
+    )
+
+    return population[
+        best_index
+    ][:]
+
+
+# ============================================================
+# Равномерный crossover
+# ============================================================
+
+def uniform_crossover(
+    parent1,
+    parent2,
+    rng,
+):
+
+    child1 = []
+    child2 = []
+
+    for (
+        gene1,
+        gene2,
+    ) in zip(
+        parent1,
+        parent2,
+    ):
+
+        if rng.random() < 0.5:
+
+            child1.append(
+                gene1
+            )
+
+            child2.append(
+                gene2
+            )
+
+        else:
+
+            child1.append(
+                gene2
+            )
+
+            child2.append(
+                gene1
+            )
+
+    return (
+        child1,
+        child2,
+    )
+
+
+# ============================================================
+# Одноточечный crossover
+# ============================================================
+
+def one_point_crossover(
+    parent1,
+    parent2,
+    rng,
+):
+
+    point = rng.randrange(
+        1,
+        len(parent1),
+    )
+
+    child1 = (
+        parent1[:point]
+        +
+        parent2[point:]
+    )
+
+    child2 = (
+        parent2[:point]
+        +
+        parent1[point:]
+    )
+
+    return (
+        child1,
+        child2,
+    )
+
+
+# ============================================================
+# Мутация
+# ============================================================
+
+def mutate_schedule(
+    schedule,
+    config,
+    rng,
+):
+
+    mutated = schedule[:]
+
+    num_slots = config[
+        "num_slots"
+    ]
+
+    for exam in range(
+        len(mutated)
+    ):
+
+        if (
+            rng.random()
+            <
+            config[
+                "mutation_rate"
+            ]
+        ):
+
+            old_slot = (
+                mutated[
+                    exam
+                ]
+            )
+
+            new_slot = (
+                rng.randrange(
+                    num_slots - 1
+                )
+            )
+
+            # Гарантируем,
+            # что слот действительно
+            # изменится.
+            if (
+                new_slot
+                >= old_slot
+            ):
+                new_slot += 1
+
+            mutated[
+                exam
+            ] = new_slot
+
+    return mutated
+
+
+# ============================================================
+# Один запуск ГА
+# ============================================================
+
+def run_ga(
+    adjacency,
+    conflicts,
+    config,
+    seed,
+    constraint_method,
+    crossover_kind,
+):
+
+    rng = random.Random(
+        seed
+    )
+
+    population = (
+        create_initial_population(
+            adjacency,
+            conflicts,
+            config,
+            rng,
+        )
+    )
+
+    best_schedule = None
+    best_evaluation = None
+
+    history = []
+
+    for generation in range(
+        config[
+            "generations"
+        ]
+        + 1
+    ):
+
+        evaluations = [
+            evaluate_schedule(
+                schedule,
+                conflicts,
+                config,
+            )
+            for schedule
+            in population
+        ]
+
+        feasible_indices = [
+            index
+            for index, evaluation
+            in enumerate(
+                evaluations
+            )
+            if evaluation.feasible
+        ]
+
+        if feasible_indices:
+
+            generation_best_index = min(
+                feasible_indices,
+                key=lambda index:
+                evaluations[
+                    index
+                ].soft_penalty,
+            )
+
+            generation_best_eval = (
+                evaluations[
+                    generation_best_index
+                ]
+            )
+
+            if (
+                best_evaluation
+                is None
+                or
+                generation_best_eval
+                .soft_penalty
+                <
+                best_evaluation
+                .soft_penalty
+            ):
+
+                best_schedule = (
+                    population[
+                        generation_best_index
+                    ][:]
+                )
+
+                best_evaluation = (
+                    generation_best_eval
+                )
+
+        if best_evaluation is None:
+            history.append(
+                math.nan
+            )
+        else:
+            history.append(
+                best_evaluation
+                .soft_penalty
+            )
+
+        if (
+            generation
+            ==
+            config[
+                "generations"
+            ]
+        ):
+            break
+
+        # --------------------------
+        # Элитизм
+        # --------------------------
+
+        elite_indices = sorted(
+            range(
+                len(population)
+            ),
+            key=lambda index:
+            evaluations[
+                index
+            ].score,
+        )[
+            :
+            config[
+                "elite_count"
+            ]
+        ]
+
+        new_population = [
+            population[
+                index
+            ][:]
+            for index
+            in elite_indices
+        ]
+
+        # --------------------------
+        # Создание потомков
+        # --------------------------
+
+        while (
+            len(
+                new_population
+            )
+            <
+            config[
+                "population_size"
+            ]
+        ):
+
+            parent1 = (
+                tournament_selection(
+                    population,
+                    evaluations,
+                    config,
+                    rng,
+                )
+            )
+
+            parent2 = (
+                tournament_selection(
+                    population,
+                    evaluations,
+                    config,
+                    rng,
+                )
+            )
+
+            if (
+                rng.random()
+                <
+                config[
+                    "crossover_rate"
+                ]
+            ):
+
+                if (
+                    crossover_kind
+                    == "uniform"
+                ):
+                    (
+                        child1,
+                        child2,
+                    ) = (
+                        uniform_crossover(
+                            parent1,
+                            parent2,
+                            rng,
+                        )
+                    )
+
+                elif (
+                    crossover_kind
+                    == "onepoint"
+                ):
+                    (
+                        child1,
+                        child2,
+                    ) = (
+                        one_point_crossover(
+                            parent1,
+                            parent2,
+                            rng,
+                        )
+                    )
+
+                else:
+                    raise ValueError(
+                        "Неизвестный "
+                        "crossover: "
+                        f"{crossover_kind}"
+                    )
+
+            else:
+                child1 = (
+                    parent1[:]
+                )
+
+                child2 = (
+                    parent2[:]
+                )
+
+            children = [
+                mutate_schedule(
+                    child1,
+                    config,
+                    rng,
+                ),
+                mutate_schedule(
+                    child2,
+                    config,
+                    rng,
+                ),
+            ]
+
+            for child in children:
+
+                if (
+                    constraint_method
+                    == "repair"
+                ):
+                    child = (
+                        repair_schedule(
+                            child,
+                            adjacency,
+                            conflicts,
+                            config,
+                            rng,
+                        )
+                    )
+
+                elif (
+                    constraint_method
+                    != "penalty"
+                ):
+                    raise ValueError(
+                        "Неизвестный "
+                        "метод ограничений: "
+                        f"{constraint_method}"
+                    )
+
+                new_population.append(
+                    child
+                )
+
+                if (
+                    len(
+                        new_population
+                    )
+                    >=
+                    config[
+                        "population_size"
+                    ]
+                ):
+                    break
+
+        population = (
+            new_population
+        )
+
+    if (
+        best_schedule is None
+        or
+        best_evaluation is None
+    ):
+        raise RuntimeError(
+            "Не найдено допустимого "
+            "расписания."
+        )
+
+    return GARunResult(
+        best_schedule=(
+            best_schedule
+        ),
+        best_evaluation=(
+            best_evaluation
+        ),
+        history=history,
+    )
+
+
+# ============================================================
+# Greedy baseline
+# ============================================================
+
+def greedy_baseline(
+    adjacency,
+    conflicts,
+    config,
+):
+
+    exam_count = len(
+        adjacency
+    )
+
+    num_slots = (
+        config[
+            "num_slots"
+        ]
+    )
+
+    sessions_per_day = (
+        config[
+            "sessions_per_day"
+        ]
+    )
+
+    order = sorted(
+        range(
+            exam_count
+        ),
+        key=lambda exam: (
+            len(
+                adjacency[
+                    exam
+                ]
+            ),
+            exam,
+        ),
+        reverse=True,
+    )
+
+    schedule = [
+        -1
+        for _ in range(
+            exam_count
+        )
+    ]
+
+    slot_counts = [
+        0
+        for _ in range(
+            num_slots
+        )
+    ]
+
+    for exam in order:
+
+        variants = []
+
+        for slot in range(
+            num_slots
+        ):
+
+            hard_students = 0
+            same_day_students = 0
+
+            day = (
+                slot
+                // sessions_per_day
+            )
+
+            for (
+                neighbour,
+                shared_students,
+            ) in adjacency[
+                exam
+            ]:
+
+                neighbour_slot = (
+                    schedule[
+                        neighbour
+                    ]
+                )
+
+                if neighbour_slot == -1:
+                    continue
+
+                if (
+                    neighbour_slot
+                    == slot
+                ):
+                    hard_students += (
+                        shared_students
+                    )
+
+                elif (
+                    neighbour_slot
+                    // sessions_per_day
+                    ==
+                    day
+                ):
+                    same_day_students += (
+                        shared_students
+                    )
+
+            if hard_students != 0:
+                continue
+
+            if (
+                slot_counts[
+                    slot
+                ]
+                == 0
+            ):
+                new_slot_penalty = (
+                    config[
+                        "used_slot_weight"
+                    ]
+                )
+            else:
+                new_slot_penalty = 0.0
+
+            score = (
+                config[
+                    "same_day_weight"
+                ]
+                * same_day_students
+                +
+                new_slot_penalty
+            )
+
+            variants.append(
+                (
+                    score,
+                    slot,
+                )
+            )
+
+        if not variants:
+            raise RuntimeError(
+                "Greedy baseline "
+                "не смог построить "
+                "расписание."
+            )
+
+        (
+            _,
+            chosen_slot,
+        ) = min(
+            variants
+        )
+
+        schedule[
+            exam
+        ] = chosen_slot
+
+        slot_counts[
+            chosen_slot
+        ] += 1
+
+    evaluation = (
+        evaluate_schedule(
+            schedule,
+            conflicts,
+            config,
+        )
+    )
+
+    return (
+        schedule,
+        evaluation,
+    )
+
+
+# ============================================================
+# Random Feasible Search
+# ============================================================
+
+def random_feasible_search(
+    adjacency,
+    conflicts,
+    config,
+    seed,
+    evaluation_budget,
+):
+
+    rng = random.Random(
+        seed
+    )
+
+    best_schedule = None
+    best_evaluation = None
+
+    evaluated = 0
+
+    while (
+        evaluated
+        <
+        evaluation_budget
+    ):
+
+        schedule = (
+            construct_feasible_schedule(
+                adjacency,
+                config,
+                rng,
+            )
+        )
+
+        if schedule is None:
+            continue
+
+        evaluation = (
+            evaluate_schedule(
+                schedule,
+                conflicts,
+                config,
+            )
+        )
+
+        if not evaluation.feasible:
+            continue
+
+        evaluated += 1
+
+        if (
+            best_evaluation
+            is None
+            or
+            evaluation.soft_penalty
+            <
+            best_evaluation
+            .soft_penalty
+        ):
+
+            best_schedule = (
+                schedule[:]
+            )
+
+            best_evaluation = (
+                evaluation
+            )
+
+    return (
+        best_schedule,
+        best_evaluation,
+    )
+
+
+# ============================================================
+# Статистика
+# ============================================================
+
+def calculate_statistics(
+    values,
+):
+
+    return {
+        "best": min(values),
+
+        "mean":
+        statistics.fmean(
+            values
+        ),
+
+        "median":
+        statistics.median(
+            values
+        ),
+
+        "std":
+        statistics.stdev(
+            values
+        )
+        if len(values) > 1
+        else 0.0,
+
+        "worst": max(values),
+    }
+
+
+# ============================================================
+# Подпись временного слота
+# ============================================================
+
+def slot_label(
+    slot,
+    config,
+):
+
+    sessions_per_day = (
+        config[
+            "sessions_per_day"
+        ]
+    )
+
+    day = (
+        slot
+        // sessions_per_day
+        + 1
+    )
+
+    session_index = (
+        slot
+        % sessions_per_day
+    )
+
+    if sessions_per_day == 2:
+
+        if session_index == 0:
+            session = "утро"
+        else:
+            session = "день"
+
+    else:
+        session = (
+            f"сессия "
+            f"{session_index + 1}"
+        )
+
+    return (
+        day,
+        session,
+    )
+
+
+# ============================================================
+# Сохранение лучшего расписания
+# ============================================================
+
+def save_schedule(
+    filename,
+    schedule,
+    evaluation,
+    exams,
+    student_counts,
+    config,
+):
+
+    path = (
+        RESULTS_DIR
+        / filename
+    )
+
+    rows = sorted(
+        range(
+            len(schedule)
+        ),
+        key=lambda exam: (
+            schedule[
+                exam
+            ],
+            exams[
+                exam
+            ].exam_id,
+        ),
+    )
+
+    with path.open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+
+        writer = csv.writer(
+            file
+        )
+
+        writer.writerow(
+            [
+                "slot",
+                "day",
+                "session",
+                "exam_id",
+                "exam_name",
+                "students",
+            ]
+        )
+
+        for exam_index in rows:
+
+            slot = schedule[
+                exam_index
+            ]
+
+            (
+                day,
+                session,
+            ) = slot_label(
+                slot,
+                config,
+            )
+
+            exam = exams[
+                exam_index
+            ]
+
+            writer.writerow(
+                [
+                    slot + 1,
+                    day,
+                    session,
+                    exam.exam_id,
+                    exam.name,
+                    student_counts[
+                        exam_index
+                    ],
+                ]
+            )
+
+        writer.writerow([])
+
+        writer.writerow(
+            [
+                "feasible",
+                int(
+                    evaluation
+                    .feasible
+                ),
+            ]
+        )
+
+        writer.writerow(
+            [
+                "hard_conflict_pairs",
+                evaluation
+                .hard_conflict_pairs,
+            ]
+        )
+
+        writer.writerow(
+            [
+                "conflicting_students",
+                evaluation
+                .conflicting_students,
+            ]
+        )
+
+        writer.writerow(
+            [
+                "same_day_students",
+                evaluation
+                .same_day_students,
+            ]
+        )
+
+        writer.writerow(
+            [
+                "used_slots",
+                evaluation
+                .used_slots,
+            ]
+        )
+
+        writer.writerow(
+            [
+                "soft_penalty",
+                evaluation
+                .soft_penalty,
+            ]
+        )
+
+
+# ============================================================
+# Примеры допустимых и недопустимых решений
+# ============================================================
+
+def save_examples(
+    adjacency,
+    conflicts,
+    config,
+):
+
+    (
+        greedy_schedule,
+        _,
+    ) = greedy_baseline(
+        adjacency,
+        conflicts,
+        config,
+    )
+
+    rng = random.Random(
+        config[
+            "run_seed_start"
+        ]
+        + 100_000
+    )
+
+    second_feasible = (
+        construct_feasible_schedule(
+            adjacency,
+            config,
+            rng,
+        )
+    )
+
+    if second_feasible is None:
+        second_feasible = (
+            greedy_schedule[:]
+        )
+
+    # Явно недопустимое:
+    # все экзамены в одном слоте.
+    infeasible_all_same = [
+        0
+        for _ in adjacency
+    ]
+
+    # Второе недопустимое:
+    # берём корректное расписание
+    # и искусственно создаём
+    # один конфликт.
+    infeasible_forced = (
+        greedy_schedule[:]
+    )
+
+    (
+        exam_a,
+        exam_b,
+        _,
+    ) = conflicts[0]
+
+    infeasible_forced[
+        exam_b
+    ] = (
+        infeasible_forced[
+            exam_a
+        ]
+    )
+
+    examples = [
+        (
+            "feasible_greedy",
+            greedy_schedule,
+        ),
+        (
+            "feasible_randomized",
+            second_feasible,
+        ),
+        (
+            "infeasible_all_in_one_slot",
+            infeasible_all_same,
+        ),
+        (
+            "infeasible_forced_conflict",
+            infeasible_forced,
+        ),
+    ]
+
+    with (
+        RESULTS_DIR
+        / "examples.csv"
+    ).open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+
+        writer = csv.writer(
+            file
+        )
+
+        writer.writerow(
+            [
+                "example",
+                "feasible",
+                "hard_conflict_pairs",
+                "conflicting_students",
+                "same_day_students",
+                "used_slots",
+                "soft_penalty",
+                "schedule",
+            ]
+        )
+
+        for (
+            name,
+            schedule,
+        ) in examples:
+
+            evaluation = (
+                evaluate_schedule(
+                    schedule,
+                    conflicts,
+                    config,
+                )
+            )
+
+            writer.writerow(
+                [
+                    name,
+
+                    int(
+                        evaluation
+                        .feasible
+                    ),
+
+                    evaluation
+                    .hard_conflict_pairs,
+
+                    evaluation
+                    .conflicting_students,
+
+                    evaluation
+                    .same_day_students,
+
+                    evaluation
+                    .used_slots,
+
+                    evaluation
+                    .soft_penalty,
+
+                    ";".join(
+                        str(
+                            slot + 1
+                        )
+                        for slot
+                        in schedule
+                    ),
+                ]
+            )
+
+
+# ============================================================
+# График сходимости
+# ============================================================
+
+def save_convergence_plot(
+    histories,
+    generations,
+):
+
+    plt.figure(
+        figsize=(
+            11,
+            6,
+        )
+    )
+
+    for (
+        method_name,
+        method_histories,
+    ) in histories.items():
+
+        means = []
+
+        for generation in range(
+            generations + 1
+        ):
+
+            values = [
+                history[
+                    generation
+                ]
+                for history
+                in method_histories
+                if not math.isnan(
+                    history[
+                        generation
+                    ]
+                )
+            ]
+
+            if values:
+                means.append(
+                    statistics.fmean(
+                        values
+                    )
+                )
+            else:
+                means.append(
+                    math.nan
+                )
+
+        plt.plot(
+            range(
+                generations + 1
+            ),
+            means,
+            label=method_name,
+        )
+
+    plt.xlabel(
+        "Поколение"
+    )
+
+    plt.ylabel(
+        "Средний лучший "
+        "мягкий штраф"
+    )
+
+    plt.title(
+        "Сходимость ГА "
+        "по 20 независимым запускам"
+    )
+
+    plt.grid(
+        alpha=0.25
+    )
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plt.savefig(
+        RESULTS_DIR
+        / "convergence.png",
+        dpi=160,
+    )
+
+    plt.close()
+
+
+# ============================================================
+# График сравнения
+# ============================================================
+
+def save_comparison_plot(
+    values_by_method,
+    greedy_value,
+):
+
+    labels = list(
+        values_by_method.keys()
+    )
+
+    data = [
+        values_by_method[
+            label
+        ]
+        for label
+        in labels
+    ]
+
+    plt.figure(
+        figsize=(
+            12,
+            6,
+        )
+    )
+
+    plt.boxplot(
+        data,
+        tick_labels=labels,
+    )
+
+    plt.axhline(
+        greedy_value,
+        linestyle="--",
+        label=(
+            "Greedy = "
+            f"{greedy_value:.3f}"
+        ),
+    )
+
+    plt.ylabel(
+        "Мягкий штраф "
+        "(меньше — лучше)"
+    )
+
+    plt.title(
+        "Сравнение "
+        "алгоритмических вариантов"
+    )
+
+    plt.xticks(
+        rotation=12
+    )
+
+    plt.grid(
+        axis="y",
+        alpha=0.25,
+    )
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plt.savefig(
+        RESULTS_DIR
+        / "comparison.png",
+        dpi=160,
+    )
+
+    plt.close()
+
+
+# ============================================================
+# Основные эксперименты
+# ============================================================
+
+def run_experiments(
+    config,
+):
+
+    RESULTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    (
+        exams,
+        conflicts,
+        student_counts,
+    ) = load_data()
+
+    if (
+        len(exams)
+        !=
+        config[
+            "num_exams"
+        ]
+    ):
+        raise ValueError(
+            "Количество экзаменов "
+            "не соответствует config.json. "
+            "Запусти: "
+            "python main.py --regenerate-data"
+        )
+
+    adjacency = (
+        build_adjacency(
+            len(exams),
+            conflicts,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Сравнения
+    # --------------------------------------------------------
+    #
+    # 1. repair_uniform vs penalty_uniform:
+    #    меняется только обработка ограничений.
+    #
+    # 2. repair_uniform vs repair_onepoint:
+    #    меняется только crossover.
+    #
+
+    experiment_configs = [
+        (
+            "GA_repair_uniform",
+            "repair",
+            "uniform",
+        ),
+        (
+            "GA_penalty_uniform",
+            "penalty",
+            "uniform",
+        ),
+        (
+            "GA_repair_onepoint",
+            "repair",
+            "onepoint",
+        ),
+    ]
+
+    runs = config[
+        "independent_runs"
+    ]
+
+    base_seed = config[
+        "run_seed_start"
+    ]
+
+    histories = {
+        name: []
+        for (
+            name,
+            _,
+            _,
+        )
+        in experiment_configs
+    }
+
+    values_by_method = {}
+
+    best_by_method = {}
+
+    run_rows = []
+
+    # ========================================================
+    # Генетический алгоритм
+    # ========================================================
+
+    for (
+        method_name,
+        constraint_method,
+        crossover_kind,
+    ) in experiment_configs:
+
+        print()
+
+        print(
+            "=" * 68
+        )
+
+        print(
+            f"Запуск серии: "
+            f"{method_name}"
+        )
+
+        print(
+            "=" * 68
+        )
+
+        values = []
+
+        for run_index in range(
+            runs
+        ):
+
+            seed = (
+                base_seed
+                + run_index
+            )
+
+            result = run_ga(
+                adjacency,
+                conflicts,
+                config,
+                seed,
+                constraint_method,
+                crossover_kind,
+            )
+
+            evaluation = (
+                result
+                .best_evaluation
+            )
+
+            values.append(
+                evaluation
+                .soft_penalty
+            )
+
+            histories[
+                method_name
+            ].append(
+                result.history
+            )
+
+            run_rows.append(
+                [
+                    method_name,
+                    run_index + 1,
+                    seed,
+
+                    int(
+                        evaluation
+                        .feasible
+                    ),
+
+                    evaluation
+                    .hard_conflict_pairs,
+
+                    evaluation
+                    .conflicting_students,
+
+                    evaluation
+                    .same_day_students,
+
+                    evaluation
+                    .used_slots,
+
+                    evaluation
+                    .soft_penalty,
+                ]
+            )
+
+            current_best = (
+                best_by_method.get(
+                    method_name
+                )
+            )
+
+            if (
+                current_best
+                is None
+                or
+                evaluation
+                .soft_penalty
+                <
+                current_best[
+                    1
+                ].soft_penalty
+            ):
+
+                best_by_method[
+                    method_name
+                ] = (
+                    result
+                    .best_schedule[:],
+
+                    evaluation,
+                )
+
+            print(
+                f"Run "
+                f"{run_index + 1:02d} | "
+                f"seed={seed} | "
+                f"soft="
+                f"{evaluation.soft_penalty:.3f} | "
+                f"same_day="
+                f"{evaluation.same_day_students} | "
+                f"slots="
+                f"{evaluation.used_slots} | "
+                f"feasible="
+                f"{evaluation.feasible}"
+            )
+
+        values_by_method[
+            method_name
+        ] = values
+
+    # ========================================================
+    # Greedy
+    # ========================================================
+
+    (
+        greedy_schedule,
+        greedy_eval,
+    ) = greedy_baseline(
+        adjacency,
+        conflicts,
+        config,
+    )
+
+    run_rows.append(
+        [
+            "Greedy",
+            1,
+            config[
+                "data_seed"
+            ],
+
+            int(
+                greedy_eval
+                .feasible
+            ),
+
+            greedy_eval
+            .hard_conflict_pairs,
+
+            greedy_eval
+            .conflicting_students,
+
+            greedy_eval
+            .same_day_students,
+
+            greedy_eval
+            .used_slots,
+
+            greedy_eval
+            .soft_penalty,
+        ]
+    )
+
+    # ========================================================
+    # Random Feasible Search
+    # ========================================================
+
+    evaluation_budget = (
+        config[
+            "population_size"
+        ]
+        *
+        (
+            config[
+                "generations"
+            ]
+            + 1
+        )
+    )
+
+    print()
+
+    print(
+        "=" * 68
+    )
+
+    print(
+        "Запуск серии: "
+        "RandomFeasibleSearch"
+    )
+
+    print(
+        "=" * 68
+    )
+
+    random_values = []
+
     best_random = None
-    for r in range(RUNS):
-        seed = BASE_SEED + r
-        rc, re = random_feasible_baseline(items, conflicts, seed, evaluation_budget)
-        random_baseline_values.append(re.utility)
-        all_rows.append(["RandomFeasibleSearch", r+1, seed, re.utility, re.price, re.power, re.conflicts, 1])
-        if best_random is None or re.utility > best_random[1].utility:
-            best_random = (rc, re)
 
-    with open(RESULTS_DIR/"runs.csv","w",newline="",encoding="utf-8-sig") as f:
-        w=csv.writer(f);w.writerow(["method","run","seed","utility","price_rub","power_w","conflicts","feasible"]);w.writerows(all_rows)
+    for run_index in range(
+        runs
+    ):
 
-    lines=["ЛР №2, вариант 5 — выбор оборудования",f"Бюджет: {BUDGET} руб.",f"Лимит мощности: {POWER_LIMIT} Вт",f"Независимых запусков ГА: {RUNS}",""]
-    for name,_,_ in configs:
-        vals=[r[3] for r in all_rows if r[0]==name]
-        lines += [name,f"  best: {max(vals):.6g}",f"  mean: {statistics.mean(vals):.6g}",f"  median: {statistics.median(vals):.6g}",
-                  f"  std: {statistics.stdev(vals):.6g}",f"  worst: {min(vals):.6g}",""]
-        save_best(name,*best_global[name],items)
-    lines += ["Greedy baseline (дополнительный конструктивный ориентир)",f"  utility: {ge.utility}",f"  price: {ge.price}",f"  power: {ge.power}",""]
-    lines += ["RandomFeasibleSearch (тот же бюджет оценок, что у ГА)",f"  evaluations per run: {evaluation_budget}",
-              f"  best: {max(random_baseline_values):.6g}",f"  mean: {statistics.mean(random_baseline_values):.6g}",
-              f"  median: {statistics.median(random_baseline_values):.6g}",
-              f"  std: {statistics.stdev(random_baseline_values):.6g}",
-              f"  worst: {min(random_baseline_values):.6g}"]
-    save_best("RandomFeasibleSearch", *best_random, items)
-    (RESULTS_DIR/"summary.txt").write_text("\n".join(lines),encoding="utf-8")
+        seed = (
+            base_seed
+            + run_index
+        )
 
-    # Convergence
-    plt.figure(figsize=(10,6))
-    for name,_,_ in configs:
-        hs=histories[name]
-        means=[statistics.mean(h[g] for h in hs) for g in range(GENERATIONS+1)]
-        plt.plot(range(GENERATIONS+1),means,label=name)
-    plt.xlabel("Поколение");plt.ylabel("Средняя лучшая полезность")
-    plt.title("Сходимость ГА по 20 независимым запускам");plt.grid(alpha=.25);plt.legend();plt.tight_layout()
-    plt.savefig(RESULTS_DIR/"convergence.png",dpi=160);plt.close()
+        (
+            schedule,
+            evaluation,
+        ) = random_feasible_search(
+            adjacency,
+            conflicts,
+            config,
+            seed,
+            evaluation_budget,
+        )
 
-    # Boxplot
-    labels=[x[0] for x in configs] + ["RandomFeasibleSearch"]
-    data=[[r[3] for r in all_rows if r[0]==name] for name in labels]
-    plt.figure(figsize=(10,6));plt.boxplot(data,tick_labels=labels)
-    plt.axhline(ge.utility,linestyle="--",label=f"Greedy = {ge.utility}")
-    plt.ylabel("Полезность");plt.title("Сравнение алгоритмических вариантов");plt.xticks(rotation=12);plt.legend();plt.tight_layout()
-    plt.savefig(RESULTS_DIR/"comparison.png",dpi=160);plt.close()
+        random_values.append(
+            evaluation
+            .soft_penalty
+        )
 
-    # Required feasible/infeasible examples
-    examples=[
-        ("feasible_1",[1 if i in [0,1,2,3] else 0 for i in range(len(items))]),
-        ("feasible_2",[1 if i in [4,7,8,14] else 0 for i in range(len(items))]),
-        ("infeasible_budget",[1]*len(items)),
-        ("infeasible_conflict",[1 if i in [5,26] else 0 for i in range(len(items))]),
+        run_rows.append(
+            [
+                "RandomFeasibleSearch",
+                run_index + 1,
+                seed,
+
+                int(
+                    evaluation
+                    .feasible
+                ),
+
+                evaluation
+                .hard_conflict_pairs,
+
+                evaluation
+                .conflicting_students,
+
+                evaluation
+                .same_day_students,
+
+                evaluation
+                .used_slots,
+
+                evaluation
+                .soft_penalty,
+            ]
+        )
+
+        if (
+            best_random is None
+            or
+            evaluation
+            .soft_penalty
+            <
+            best_random[
+                1
+            ].soft_penalty
+        ):
+            best_random = (
+                schedule[:],
+                evaluation,
+            )
+
+        print(
+            f"Run "
+            f"{run_index + 1:02d} | "
+            f"seed={seed} | "
+            f"soft="
+            f"{evaluation.soft_penalty:.3f} | "
+            f"same_day="
+            f"{evaluation.same_day_students} | "
+            f"slots="
+            f"{evaluation.used_slots}"
+        )
+
+    values_by_method[
+        "RandomFeasibleSearch"
+    ] = random_values
+
+    # ========================================================
+    # runs.csv
+    # ========================================================
+
+    with (
+        RESULTS_DIR
+        / "runs.csv"
+    ).open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+
+        writer = csv.writer(
+            file
+        )
+
+        writer.writerow(
+            [
+                "method",
+                "run",
+                "seed",
+                "feasible",
+                "hard_conflict_pairs",
+                "conflicting_students",
+                "same_day_students",
+                "used_slots",
+                "soft_penalty",
+            ]
+        )
+
+        writer.writerows(
+            run_rows
+        )
+
+    # ========================================================
+    # Лучшие расписания
+    # ========================================================
+
+    for (
+        method_name,
+        (
+            schedule,
+            evaluation,
+        ),
+    ) in best_by_method.items():
+
+        save_schedule(
+            (
+                f"best_"
+                f"{method_name}.csv"
+            ),
+            schedule,
+            evaluation,
+            exams,
+            student_counts,
+            config,
+        )
+
+    save_schedule(
+        "best_Greedy.csv",
+        greedy_schedule,
+        greedy_eval,
+        exams,
+        student_counts,
+        config,
+    )
+
+    if best_random is not None:
+
+        save_schedule(
+            "best_RandomFeasibleSearch.csv",
+            best_random[0],
+            best_random[1],
+            exams,
+            student_counts,
+            config,
+        )
+
+    # ========================================================
+    # Два допустимых и два недопустимых примера
+    # ========================================================
+
+    save_examples(
+        adjacency,
+        conflicts,
+        config,
+    )
+
+    # ========================================================
+    # summary.txt
+    # ========================================================
+
+    summary_lines = [
+        "Лабораторная работа №2",
+
+        (
+            "Вариант 19 — "
+            "расписание экзаменов "
+            "с конфликтами студентов"
+        ),
+
+        "",
+
+        (
+            f"Экзаменов: "
+            f"{len(exams)}"
+        ),
+
+        (
+            "Конфликтующих пар "
+            f"экзаменов: "
+            f"{len(conflicts)}"
+        ),
+
+        (
+            "Временных слотов: "
+            f"{config['num_slots']}"
+        ),
+
+        (
+            "Сессий в день: "
+            f"{config['sessions_per_day']}"
+        ),
+
+        (
+            "Независимых запусков: "
+            f"{runs}"
+        ),
+
+        (
+            "Бюджет оценок "
+            "одного запуска: "
+            f"{evaluation_budget}"
+        ),
+
+        "",
+
+        (
+            "Критерий: минимизация "
+            "мягкого штрафа среди "
+            "допустимых расписаний."
+        ),
+
+        (
+            "Жёсткое ограничение: "
+            "конфликтующие экзамены "
+            "не находятся "
+            "в одном слоте."
+        ),
+
+        "",
     ]
-    with open(RESULTS_DIR/"examples.csv","w",newline="",encoding="utf-8-sig") as f:
-        w=csv.writer(f);w.writerow(["example","utility","price_rub","power_w","conflicts","feasible","selected_ids"])
-        for n,c in examples:
-            e=evaluate(c,items,conflicts,"repair")
-            w.writerow([n,e.utility,e.price,e.power,e.conflicts,int(e.feasible),";".join(str(i+1) for i,b in enumerate(c) if b)])
-    print("\n".join(lines))
-    print(f"\nРезультаты сохранены: {RESULTS_DIR}")
+
+    for (
+        method_name,
+        _,
+        _,
+    ) in experiment_configs:
+
+        stats = (
+            calculate_statistics(
+                values_by_method[
+                    method_name
+                ]
+            )
+        )
+
+        summary_lines.extend(
+            [
+                method_name,
+
+                (
+                    "  best:   "
+                    f"{stats['best']:.6f}"
+                ),
+
+                (
+                    "  mean:   "
+                    f"{stats['mean']:.6f}"
+                ),
+
+                (
+                    "  median: "
+                    f"{stats['median']:.6f}"
+                ),
+
+                (
+                    "  std:    "
+                    f"{stats['std']:.6f}"
+                ),
+
+                (
+                    "  worst:  "
+                    f"{stats['worst']:.6f}"
+                ),
+
+                "",
+            ]
+        )
+
+    random_stats = (
+        calculate_statistics(
+            random_values
+        )
+    )
+
+    summary_lines.extend(
+        [
+            "Greedy baseline",
+
+            (
+                "  soft_penalty: "
+                f"{greedy_eval.soft_penalty:.6f}"
+            ),
+
+            (
+                "  same_day_students: "
+                f"{greedy_eval.same_day_students}"
+            ),
+
+            (
+                "  used_slots: "
+                f"{greedy_eval.used_slots}"
+            ),
+
+            "",
+
+            "RandomFeasibleSearch",
+
+            (
+                "  evaluations per run: "
+                f"{evaluation_budget}"
+            ),
+
+            (
+                "  best:   "
+                f"{random_stats['best']:.6f}"
+            ),
+
+            (
+                "  mean:   "
+                f"{random_stats['mean']:.6f}"
+            ),
+
+            (
+                "  median: "
+                f"{random_stats['median']:.6f}"
+            ),
+
+            (
+                "  std:    "
+                f"{random_stats['std']:.6f}"
+            ),
+
+            (
+                "  worst:  "
+                f"{random_stats['worst']:.6f}"
+            ),
+        ]
+    )
+
+    (
+        RESULTS_DIR
+        / "summary.txt"
+    ).write_text(
+        "\n".join(
+            summary_lines
+        ),
+        encoding="utf-8",
+    )
+
+    # ========================================================
+    # Графики
+    # ========================================================
+
+    save_convergence_plot(
+        histories,
+        config[
+            "generations"
+        ],
+    )
+
+    save_comparison_plot(
+        values_by_method,
+        greedy_eval
+        .soft_penalty,
+    )
+
+    # ========================================================
+    # Консоль
+    # ========================================================
+
+    print()
+
+    print(
+        "=" * 68
+    )
+
+    print(
+        "ИТОГОВАЯ СТАТИСТИКА"
+    )
+
+    print(
+        "=" * 68
+    )
+
+    print(
+        "\n".join(
+            summary_lines
+        )
+    )
+
+    print()
+
+    print(
+        "Результаты сохранены в: "
+        f"{RESULTS_DIR}"
+    )
+
+
+# ============================================================
+# main
+# ============================================================
 
 def main():
-    p=argparse.ArgumentParser(description="ЛР2, вариант 5: дискретный ГА выбора оборудования")
-    p.add_argument("--runs",action="store_true",help="выполнить полную серию экспериментов")
-    args=p.parse_args()
-    run_experiments()
 
-if __name__=="__main__":
+    parser = argparse.ArgumentParser(
+        description=(
+            "ЛР №2, вариант 19: "
+            "генетическое построение "
+            "расписания экзаменов"
+        )
+    )
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=(
+            BASE_DIR
+            / "config.json"
+        ),
+        help=(
+            "Путь к config.json"
+        ),
+    )
+
+    parser.add_argument(
+        "--regenerate-data",
+        action="store_true",
+        help=(
+            "Пересоздать "
+            "синтетические "
+            "входные данные"
+        ),
+    )
+
+    args = parser.parse_args()
+
+    config = load_config(
+        args.config
+    )
+
+    ensure_data(
+        config,
+        regenerate=(
+            args.regenerate_data
+        ),
+    )
+
+    run_experiments(
+        config
+    )
+
+
+if __name__ == "__main__":
     main()

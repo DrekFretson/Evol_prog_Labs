@@ -1,0 +1,42 @@
+{
+  "variant": 19,
+  "track": "A",
+  "problem": "Управление светофором в симуляции",
+
+  "independent_runs": 20,
+  "base_seed": 31900,
+  "scenario_seed": 31919,
+
+  "simulation": {
+    "horizon_seconds": 600,
+    "arrival_probability_ns": 0.35,
+    "arrival_probability_ew": 0.25,
+    "transition_seconds": 3,
+    "service_rate_per_second": 1
+  },
+
+  "nsga2": {
+    "population_size": 50,
+    "generations": 40,
+    "min_green": 8,
+    "max_green": 50,
+    "crossover_probability": 0.90,
+    "mutation_probability": 0.25,
+    "mutation_sigma": 5.0
+  },
+
+  "weighted_sum": {
+    "weights": [
+      0.3333333333,
+      0.3333333333,
+      0.3333333334
+    ],
+    "normalization_scales": [
+      30.0,
+      10.0,
+      200.0
+    ],
+    "tournament_size": 3,
+    "elite_count": 2
+  }
+}
